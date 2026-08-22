@@ -524,8 +524,7 @@ def second_order_step_dpmsolver(
 
     return batch.replace(pos=pos_next, node_orientations=so3_sample)
 
-
-def dpm_solver(
+def membrane_guided_dpm_solver(
     sdes: dict[str, SDE],
     batch: Batch,
     N: int,
@@ -535,20 +534,16 @@ def dpm_solver(
     device: torch.device,
     record_grad_steps: set[int] = set(),
     noise: float = 0.0,
+    # --- NEW ARGS FOR GUIDANCE ---
+    frame_classifier: torch.nn.Module = None,
+    imm1_potential: torch.nn.Module = None,
+    guidance_scale: float = 1.0,
 ) -> Batch:
-    """
-    Implements the DPM solver for the VPSDE, with the Cosine noise schedule.
-    Following this paper: https://arxiv.org/abs/2206.00927 Algorithm 1 DPM-Solver-2.
-
-    This is the unsteered denoiser. For steered sampling (FKC/SMC), use
-    dpm_solver_fkc or dpm_solver_smc from the steering package.
-    """
-    grad_is_enabled = torch.is_grad_enabled()
+    """Guided DPM solver injecting exact translational gradients."""
     assert isinstance(batch, Batch)
     assert max_t < 1.0
 
     batch = batch.to(device)
-
     if isinstance(score_model, torch.nn.Module):
         score_model = score_model.to(device)
     pos_sde = sdes["pos"]
@@ -563,43 +558,60 @@ def dpm_solver(
     batch = cast(ChemGraph, batch)
 
     so3_sde = sdes["node_orientations"]
-    assert isinstance(so3_sde, SO3SDE)
     so3_sde.to(device)
 
     timesteps = torch.linspace(max_t, eps_t, N, device=device)
     dt = -torch.tensor((max_t - eps_t) / (N - 1)).to(device)
-    ts_min = 0.0
-    ts_max = 1.0
+    ts_min, ts_max = 0.0, 1.0
     fields = list(sdes.keys())
     noisers = {
-        name: EulerMaruyamaPredictor(
-            corruption=sde, noise_weight=1.0, marginal_concentration_factor=1.0
-        )
+        name: EulerMaruyamaPredictor(corruption=sde, noise_weight=1.0)
         for name, sde in sdes.items()
     }
 
-    for i in tqdm(range(N - 1), position=1, desc="Denoising: ", ncols=0, leave=False):
+    for i in tqdm(range(N - 1), position=1, desc="Guided Denoising: ", ncols=0, leave=False):
         t = torch.full((batch.num_graphs,), timesteps[i], device=device)
         t_hat = t - noise * dt if (i > 0 and t[0] > ts_min and t[0] < ts_max) else t
         t_next = t + dt
 
-        # Pre-step noise injection (Karras/Heun style)
         vals_hat = {}
         for field in fields:
             vals_hat[field] = noisers[field].forward_sde_step(
                 x=batch[field], t=t, dt=(t_hat - t)[0], batch_idx=batch.batch
             )[0]
         batch_hat = batch.replace(**vals_hat)
-
-        # Evaluate score at (possibly noised) state
-        with torch.set_grad_enabled(grad_is_enabled and (i in record_grad_steps)):
-            score = get_score(batch=batch_hat, t=t_hat, score_model=score_model, sdes=sdes)
-
         batch_idx = batch_hat.batch
 
-        # Coefficients + midpoint prediction
-        coeffs = _get_dpm_coefficients(pos_sde, batch_hat.pos, t_hat, t_next, batch_idx)
+        # Guidance strats here
+        # Force gradient tracking on position for guidance calculus
+        with torch.enable_grad():
+            batch_hat.pos.requires_grad_(True)
+            
+            # Base unguided score
+            score = get_score(batch=batch_hat, t=t_hat, score_model=score_model, sdes=sdes)
+            
+            # Calculate Tweedie Estimate (x0_hat)
+            coeffs = _get_dpm_coefficients(pos_sde, batch_hat.pos, t_hat, t_next, batch_idx)
+            x0_hat = (batch_hat.pos + (coeffs.sigma_t ** 2) * score["pos"]) / coeffs.alpha_t
+            
+            # Run classifier and physics potential
+            if frame_classifier is not None and imm1_potential is not None:
+                membrane_preds = frame_classifier(batch_hat, x0_hat)
+                imm1_energy = imm1_potential(x0_hat, membrane_preds)
+                
+                # Compute gradient (summing energy to get a scalar for autograd)
+                guidance_grad = torch.autograd.grad(outputs=imm1_energy.sum(), inputs=batch_hat.pos)[0]
+                
+                # Inject steering strictly into translational score
+                score["pos"] = score["pos"] + (guidance_scale * guidance_grad)
+            
+            # Detach tensors to prevent memory leaks across loops
+            batch_hat.pos = batch_hat.pos.detach()
+            score["pos"] = score["pos"].detach()
+            score["node_orientations"] = score["node_orientations"].detach()
+        # --- END OF GUIDANCE INJECTION ---
 
+        # Continue with standard DPM-Solver midpoint prediction
         batch_lambda = _predict_midpoint(
             batch=batch_hat,
             coeffs=coeffs,
@@ -610,13 +622,11 @@ def dpm_solver(
             batch_idx=batch_idx,
         )
 
-        # Correction step: evaluate score at midpoint
-        with torch.set_grad_enabled(grad_is_enabled and (i in record_grad_steps)):
+        with torch.set_grad_enabled(False):
             score_lambda = get_score(
                 batch=batch_lambda, t=coeffs.t_lambda, sdes=sdes, score_model=score_model
             )
 
-        # DPM-Solver 2nd-order ODE step (midpoint-only formula)
         batch = second_order_step_dpmsolver(
             batch=batch_hat,
             coeffs=coeffs,
