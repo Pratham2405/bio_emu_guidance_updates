@@ -1,4 +1,7 @@
-# Copyright (c) Microsoft Corporation.
+# In denoiser.py
+import torch
+# Import your colleague's module
+from bioemu.steering.custom_potentials import MembranePotentialPlaceholder """ This is our Paceholder defined in the aformentioned directory"""
 # Licensed under the MIT License.
 import logging
 from dataclasses import dataclass
@@ -523,7 +526,9 @@ def second_order_step_dpmsolver(
     )
 
     return batch.replace(pos=pos_next, node_orientations=so3_sample)
-
+membrane_evaluator = MembranePotentialPlaceholder()
+"""For ease of access, I am instantiating the potential globally, feel free
+to change it as per your needs and leave a small commit note for any substantial change or whatsapp me."""
 def membrane_guided_dpm_solver(
     sdes: dict[str, SDE],
     batch: Batch,
@@ -534,12 +539,9 @@ def membrane_guided_dpm_solver(
     device: torch.device,
     record_grad_steps: set[int] = set(),
     noise: float = 0.0,
-    # --- NEW ARGS FOR GUIDANCE ---
-    frame_classifier: torch.nn.Module = None,
-    imm1_potential: torch.nn.Module = None,
     guidance_scale: float = 1.0,
 ) -> Batch:
-    """Guided DPM solver injecting exact translational gradients."""
+    """Guided DPM solver injecting translational gradients. Will uise Quaternions from RegFlow for rotational."""
     assert isinstance(batch, Batch)
     assert max_t < 1.0
 
@@ -595,17 +597,17 @@ def membrane_guided_dpm_solver(
             x0_hat = (batch_hat.pos + (coeffs.sigma_t ** 2) * score["pos"]) / coeffs.alpha_t
             
             # Run classifier and physics potential
-            if frame_classifier is not None and imm1_potential is not None:
-                membrane_preds = frame_classifier(batch_hat, x0_hat)
-                imm1_energy = imm1_potential(x0_hat, membrane_preds)
+            
+                
+            custom_pot_energy = membrane_evaluator(x0_hat)
                 
                 # Compute gradient (summing energy to get a scalar for autograd)
-                guidance_grad = torch.autograd.grad(outputs=imm1_energy.sum(), inputs=batch_hat.pos)[0]
-                
-                # Inject steering strictly into translational score
-                score["pos"] = score["pos"] + (guidance_scale * guidance_grad)
+            guidance_grad = torch.autograd.grad(outputs=custom_pot_energy.sum(), inputs=batch_hat.pos)[0]
             
-            # Detach tensors to prevent memory leaks across loops
+            # 4. Inject steering
+            eta_scale = 1.5
+            score["pos"] = score["pos"] + (eta_scale * guidance_grad)
+            
             batch_hat.pos = batch_hat.pos.detach()
             score["pos"] = score["pos"].detach()
             score["node_orientations"] = score["node_orientations"].detach()
