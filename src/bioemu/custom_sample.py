@@ -63,6 +63,7 @@ def main(
     msa_host_url: str | None = None,
     filter_samples: bool = True,
     base_seed: int | None = None,
+    membrane_csv_path: str | Path | None = None,
 ) -> None:
     
     if base_seed is None:
@@ -133,6 +134,7 @@ def main(
             cache_embeds_dir=cache_embeds_dir,
             msa_file=msa_file,
             msa_host_url=msa_host_url,
+            membrane_csv_path=membrane_csv_path,
         )
 
         batch = {k: v.cpu().numpy() for k, v in batch.items()}
@@ -191,6 +193,7 @@ def generate_batch(
     cache_embeds_dir: str | Path | None,
     msa_file: str | Path | None = None,
     msa_host_url: str | None = None,
+    membrane_csv_path: str | Path | None = None,
 ) -> dict[str, torch.Tensor]:
 
     torch.manual_seed(seed)
@@ -217,6 +220,7 @@ def generate_batch(
         max_t=0.999,          # Max noise level
         eps_t=1e-3,           # Min noise level
         device=device,
+        membrane_csv_path=membrane_csv_path,
     )
     # -------------------------------------------------------------
 
