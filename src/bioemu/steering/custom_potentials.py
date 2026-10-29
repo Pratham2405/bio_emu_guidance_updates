@@ -18,7 +18,10 @@ loss_fn and energy_form_cv functions explicitly. Their detqails are as follows(c
 
 import torch
 from .potentials import Potential
+import csv
+import warnings
 
+from membrane_csv import *
 
 class MembranePotentialPlaceholder(Potential):
     """
@@ -133,12 +136,8 @@ class MembranePotentialPlaceholder(Potential):
                            membrane_interacting == True in the CSV
                            contribute to the summed energy.
         """
-        import csv
 
-        self.classifier = None  # Frame-Class hook retained for compatibility;
-        # unused by this potential. Wire it back in here if you want to
-        # combine this with a live classifier-based term later.
-
+        
         self.membrane_axis = membrane_axis
         self.membrane_center = membrane_center
         self.only_interacting = only_interacting
@@ -161,10 +160,9 @@ class MembranePotentialPlaceholder(Potential):
         ) = self._build_param_tensors(self.residue_types)
 
     def _build_param_tensors(self, resnames):
-        import warnings
 
         n_res = len(resnames)
-        # p1 = dE0 (sigmoid) or dEmin (gaussian); p2 = Zmid or Zmin; p3 = n or sigma.
+        # p1 = E0 (sigmoid) or Emin (gaussian); p2 = Zmid or Zmin; p3 = n or sigma.
         p1 = torch.zeros(n_res)
         p2 = torch.zeros(n_res)
         p3 = torch.ones(n_res)  # avoid div-by-zero for zero/unknown residues
@@ -197,7 +195,7 @@ class MembranePotentialPlaceholder(Potential):
         energy = torch.where(is_gaussian, gaussian_energy, sigmoid_energy)
         return energy * is_known  # unknown/zero-form residues (Cys, unrecognized) -> 0
 
-    def __call__(self, ca_pos_nm: torch.Tensor, *, t=None, sequence=None) -> torch.Tensor:
+    def __call__(self, ca_pos_nm: torch.Tensor, ref_pos_nm: torch.Tensor, *, t=None, sequence=None) -> torch.Tensor:
         """
         This takes the Tweedie estimate, computes each Ca's live depth along
         the membrane normal, and evaluates the Senes et al. 2007 Ez-potential
@@ -240,9 +238,22 @@ class MembranePotentialPlaceholder(Potential):
         # nm -> Angstrom (Ez parameters are tabulated in Angstrom); z is the
         # ABSOLUTE distance from the bilayer midplane (both
         # membrane faces are treated symmetrically).
-        z_ang = ca_pos_nm[..., self.membrane_axis] * 10.0
-        z_abs = torch.abs(z_ang - self.membrane_center)  # (..., n_res)
+        # z_ang = ca_pos_nm[..., self.membrane_axis] * 10.0
+        # z_abs = torch.abs(z_ang - self.membrane_center)  # (..., n_res)
 
+        # The above z calculation has to be exchanged with the distance from the OPM-derived membrane plane.
+        # It has been noted that the OPM algorithm assumes the membrane-plane to be parallel to the x-y plane at z = -15.40. Assuming that to be the case, for all OPM entries,
+        # I have hardcoded the membrane distance to be the difference between the z-axis coordinate and -15.40.
+        np_ca_pos_nm = numpy_from_torch(ca_pos_nm)      # finding a function which does the conversion to numpy from torch. 
+        np_ref_pos_nm = numpy_from_torch(ref_pos_nm)
+        rot, tran, _ = kabsch_rot_tran(np_ca_pos_nm, np_ref_pos_nm)   
+        ca_pos_nm = torch_from_numpy(np_ca_pos_nm)              # finding a function which does the conversion from numpy to torch.
+
+        x0_aligned = ca_pos_nm @ rot + tran
+
+        z_coords  = x0_aligned[..., self.membrane_axis] * 10.0
+        z_abs = torch.abs(z_coords - (-15.40))
+        
         per_res_energy = self._ez_energy(z_abs, p1, p2, p3, is_gaussian, is_known)
 
         if self.only_interacting:
